@@ -70,6 +70,11 @@ construct its response.
 Listen setup has no separate timeout; when configured, the route request-timeout policy bounds it
 before the downstream response begins.
 
+Reloading a standalone route with changed inline `mcpAuthorization` rules can invalidate cached
+tool lists. Agentgateway sends `notifications/tools/list_changed` on that route's open Streamable
+HTTP GET streams and on `subscriptions/listen` streams that acknowledged `toolsListChanged`.
+The signal contains no tool names. Each client fetches its own filtered list with `tools/list`.
+
 ---
 
 With this approach, we should fully support new clients. And, when the client _and_ server are new, we get the optimal

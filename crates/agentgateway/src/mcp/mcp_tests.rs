@@ -4321,6 +4321,374 @@ async fn authorization_deny_specific_tool_filters_only_that_tool() {
 }
 
 #[tokio::test]
+async fn route_authorization_reload_invalidates_tool_lists() {
+	use std::convert::Infallible;
+	use std::time::Duration;
+
+	use axum::response::IntoResponse;
+	use axum::response::sse::{Event, Sse};
+	use futures_util::StreamExt;
+	use serde_json::{Value, json};
+	use tower::ServiceExt;
+
+	const CHANGED: &str = "notifications/tools/list_changed";
+	const ACK: &str = "notifications/subscriptions/acknowledged";
+
+	fn event(message: Value) -> Result<Event, Infallible> {
+		Ok(Event::default().data(message.to_string()))
+	}
+
+	async fn next_frame(
+		stream: &mut (impl futures_core::Stream<Item = Value> + Unpin),
+	) -> Option<Value> {
+		tokio::time::timeout(Duration::from_secs(2), stream.next())
+			.await
+			.ok()
+			.flatten()
+	}
+
+	let (upstream_events, _) = tokio::sync::broadcast::channel::<Value>(8);
+	let upstream = axum::Router::new().route(
+		"/mcp",
+		axum::routing::get({
+			let upstream_events = upstream_events.clone();
+			move || {
+				let updates = upstream_events.subscribe();
+				async move {
+					Sse::new(tokio_stream::wrappers::BroadcastStream::new(updates).map(|v| event(v.unwrap())))
+				}
+			}
+		})
+		.post({
+			let upstream_events = upstream_events.clone();
+			move |axum::Json(body): axum::Json<Value>| {
+				let updates = upstream_events.subscribe();
+				async move {
+					let result = match body["method"].as_str().unwrap() {
+						"initialize" => json!({
+							"protocolVersion": "2025-11-25",
+							"capabilities": {"tools": {"listChanged": true}},
+							"serverInfo": {"name": "test", "version": "1"}
+						}),
+						"notifications/initialized" => return http::StatusCode::ACCEPTED.into_response(),
+						"tools/list" => json!({
+							"resultType": "complete",
+							"tools": (["lookup", "export"].map(|name| json!({
+								"name": name, "inputSchema": {"type": "object"}
+							})))
+						}),
+						"tools/call" => json!({"content": [{"type": "text", "text": "called"}]}),
+						"subscriptions/listen" => {
+							let ack = event(json!({
+								"jsonrpc": "2.0", "method": ACK,
+								"params": {"notifications": body["params"]["notifications"]}
+							}));
+							let updates = tokio_stream::wrappers::BroadcastStream::new(updates);
+							return Sse::new(
+								futures_util::stream::iter([ack]).chain(updates.map(|v| event(v.unwrap()))),
+							)
+							.into_response();
+						},
+						method => panic!("unexpected upstream request {method}"),
+					};
+					let mut response = axum::Json(json!({
+						"jsonrpc": "2.0", "id": body["id"], "result": result
+					}))
+					.into_response();
+					if body["method"] == "initialize" {
+						response
+							.headers_mut()
+							.insert("mcp-session-id", "upstream-session".parse().unwrap());
+					}
+					response
+				}
+			}
+		}),
+	);
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let upstream_addr = listener.local_addr().unwrap();
+	tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+	let dir = tempfile::tempdir().unwrap();
+	let port = std::net::TcpListener::bind("127.0.0.1:0")
+		.unwrap()
+		.local_addr()
+		.unwrap()
+		.port();
+	let mut config = crate::config::parse_config("{}".to_string(), None).unwrap();
+	config.xds.address = None;
+	config.storage.mode = ConfigStoreMode::Hybrid;
+	config.xds.local_config = Some(ConfigSource::Static(
+		format!("gateways:\n  default:\n    port: {port}\n    bindAddress: 127.0.0.1\n").into(),
+	));
+	let store = crate::config_store::setup(&crate::database::DatabaseConfig {
+		url: format!("sqlite://{}", dir.path().join("config.db").display()),
+		max_connections: None,
+	})
+	.await
+	.unwrap();
+	let mut t = setup_proxy_test_with_config(config);
+	let (ready, _) = tokio::sync::watch::channel(());
+	let state = crate::state_manager::StateManager::new(
+		t.pi.cfg.clone(),
+		t.pi.upstream.clone(),
+		Arc::new(agent_xds::Metrics::new(
+			&mut prometheus_client::registry::Registry::default(),
+		)),
+		ready,
+		Some(store.clone()),
+		t.pi.model_catalog.clone(),
+	)
+	.await
+	.unwrap();
+	let inputs = Arc::get_mut(&mut t.pi).unwrap();
+	inputs.stores = state.stores();
+	inputs.mcp_state =
+		crate::mcp::App::new(inputs.stores.clone(), inputs.cfg.session_encoder.clone());
+	let management = crate::ui::router(
+		inputs.cfg.clone(),
+		inputs.model_catalog.clone(),
+		Some(store),
+		state.resource_manager(),
+		&crate::ui::EMPTY_ASSETS_DIR,
+	);
+	let update_route = |alice_tool: &str| {
+		let management = management.clone();
+		let body = json!({"resources": [{"value": {
+			"name": "shared-mcp",
+			"gateways": ["default"],
+			"matches": [{"path": {"pathPrefix": "/mcp"}}],
+			"policies": {
+				"apiKey": {"mode": "strict", "keys": [
+					{"key": "alice-key", "metadata": {"member": "alice"}},
+					{"key": "bob-key", "metadata": {"member": "bob"}}
+				]},
+				"mcpAuthorization": {"rules": [
+					format!(r#"apiKey.member == "alice" && mcp.tool.name == "{alice_tool}""#),
+					r#"apiKey.member == "bob" && mcp.tool.name == "export""#.to_string()
+				]}
+			},
+			"backends": [{"mcp": {"targets": [
+				{"name": "upstream", "mcp": {"host": format!("http://{upstream_addr}/mcp")}}
+			]}}]
+		}}]});
+		async move {
+			let response = management
+				.oneshot(
+					axum::extract::Request::builder()
+						.method("PUT")
+						.uri("/api/config/resources/traffic.route")
+						.header("content-type", "application/json")
+						.body(axum::body::Body::from(body.to_string()))
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			let status = response.status();
+			let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+				.await
+				.unwrap();
+			assert_eq!(
+				status,
+				http::StatusCode::OK,
+				"{}",
+				String::from_utf8_lossy(&body)
+			);
+		}
+	};
+	let io = t.serve_real_listener(strng::format!("bind/{port}")).await;
+	let client = reqwest::Client::new();
+	let url = format!("http://{io}/mcp");
+	let post = |body: &Value, key: &str, session: Option<&str>| {
+		let req = mcp_json_post(&client, &url, body).bearer_auth(key);
+		match session {
+			Some(id) => req
+				.header("mcp-protocol-version", "2025-11-25")
+				.header("mcp-session-id", id),
+			None => req
+				.header("mcp-protocol-version", "2026-07-28")
+				.header("mcp-method", body["method"].as_str().unwrap()),
+		}
+	};
+	let frames = |response: reqwest::Response| {
+		sse_stream::SseStream::from_bytes_stream(
+			response
+				.bytes_stream()
+				.map(|v| v.map_err(std::io::Error::other)),
+		)
+		.filter_map(|frame| async move {
+			frame
+				.unwrap()
+				.data
+				.filter(|s| !s.is_empty())
+				.map(|s| serde_json::from_str::<Value>(&s).unwrap())
+		})
+		.boxed()
+	};
+	let rpc = |method: &str, key: &str, session: Option<&str>, mut params: Value| {
+		if session.is_none() {
+			params["_meta"] = modern_meta();
+		}
+		let req = post(
+			&json!({"jsonrpc":"2.0", "id":5, "method":method, "params":params}),
+			key,
+			session,
+		);
+		async move {
+			let response = req.send().await.unwrap();
+			let content_type = response
+				.headers()
+				.get("content-type")
+				.and_then(|value| value.to_str().ok())
+				.unwrap_or_default();
+			if content_type.starts_with("text/event-stream") {
+				next_frame(&mut frames(response)).await.unwrap()
+			} else if content_type == "application/json" {
+				response.json::<Value>().await.unwrap()
+			} else {
+				Value::Null
+			}
+		}
+	};
+	let wait_for_tool = |name: &'static str| async move {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let listed = rpc("tools/list", "alice-key", None, json!({})).await;
+				if listed["result"]["tools"][0]["name"] == name {
+					assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 1);
+					break;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("updated tool policy did not take effect");
+	};
+
+	update_route("lookup").await;
+	wait_for_tool("lookup").await;
+	let mut initialize = mcp_initialize_body();
+	initialize["params"]["protocolVersion"] = json!("2025-11-25");
+	let init = mcp_json_post(&client, &url, &initialize)
+		.bearer_auth("alice-key")
+		.send()
+		.await
+		.unwrap()
+		.error_for_status()
+		.unwrap();
+	let session = init.headers()["mcp-session-id"]
+		.to_str()
+		.unwrap()
+		.to_string();
+	init.bytes().await.unwrap();
+	let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+	assert_eq!(
+		post(&initialized, "alice-key", Some(&session))
+			.send()
+			.await
+			.unwrap()
+			.status(),
+		http::StatusCode::ACCEPTED
+	);
+	let get = client
+		.get(&url)
+		.bearer_auth("alice-key")
+		.header("accept", "text/event-stream")
+		.header("mcp-session-id", &session)
+		.header("mcp-protocol-version", "2025-11-25")
+		.send()
+		.await
+		.unwrap()
+		.error_for_status()
+		.unwrap();
+	let mut legacy = frames(get);
+	let listen = |notifications: Value| {
+		post(
+			&json!({"jsonrpc":"2.0", "id":11, "method":"subscriptions/listen", "params": {
+				"_meta": modern_meta(), "notifications": notifications
+			}}),
+			"alice-key",
+			None,
+		)
+		.send()
+	};
+	let mut modern = frames(
+		listen(json!({"toolsListChanged": true}))
+			.await
+			.unwrap()
+			.error_for_status()
+			.unwrap(),
+	);
+	let mut prompts_only = frames(
+		listen(json!({"promptsListChanged": true}))
+			.await
+			.unwrap()
+			.error_for_status()
+			.unwrap(),
+	);
+	let modern_ack = next_frame(&mut modern).await.unwrap();
+	assert_eq!(modern_ack["method"], ACK);
+	assert_eq!(
+		modern_ack["params"]["notifications"]["toolsListChanged"],
+		true
+	);
+	assert_eq!(next_frame(&mut prompts_only).await.unwrap()["method"], ACK);
+
+	let upstream_change = || {
+		upstream_events
+			.send(json!({"jsonrpc":"2.0", "method": CHANGED}))
+			.unwrap()
+	};
+	upstream_change();
+	assert_eq!(next_frame(&mut legacy).await.unwrap()["method"], CHANGED);
+	assert_eq!(next_frame(&mut modern).await.unwrap()["method"], CHANGED);
+
+	update_route("export").await;
+	wait_for_tool("export").await;
+	let listed = rpc("tools/list", "alice-key", Some(&session), json!({})).await;
+	assert_eq!(listed["result"]["tools"][0]["name"], "export");
+	assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 1);
+	let denied = rpc(
+		"tools/call",
+		"alice-key",
+		Some(&session),
+		json!({"name": "lookup", "arguments": {}}),
+	)
+	.await;
+	assert_eq!(denied["error"]["message"], "unknown resource");
+	let allowed = rpc(
+		"tools/call",
+		"alice-key",
+		Some(&session),
+		json!({"name": "export", "arguments": {}}),
+	)
+	.await;
+	assert_eq!(allowed["result"]["content"][0]["text"], "called");
+	let bob = rpc("tools/list", "bob-key", None, json!({})).await;
+	assert_eq!(bob["result"]["tools"][0]["name"], "export");
+
+	let (legacy_change, modern_change) =
+		tokio::join!(next_frame(&mut legacy), next_frame(&mut modern));
+	// An explicit upstream notification still reaches both original streams.
+	upstream_change();
+	assert_eq!(next_frame(&mut legacy).await.unwrap()["method"], CHANGED);
+	assert_eq!(next_frame(&mut modern).await.unwrap()["method"], CHANGED);
+	assert_eq!(
+		(
+			legacy_change.as_ref().map(|v| &v["method"]),
+			modern_change.as_ref().map(|v| &v["method"])
+		),
+		(Some(&json!(CHANGED)), Some(&json!(CHANGED))),
+		"the applied authorization update must invalidate both open tool lists"
+	);
+	assert_eq!(
+		modern_change.unwrap()["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+		11
+	);
+	assert!(next_frame(&mut prompts_only).await.is_none());
+}
+
+#[tokio::test]
 async fn resource_scoped_listen_preserves_global_filters_for_other_backends() {
 	use wiremock::{Mock, ResponseTemplate};
 

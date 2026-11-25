@@ -126,9 +126,33 @@ pub struct Store {
 	tcp_routes: HbHashMap<RouteTarget, Arc<TCPRouteSet>>,
 	listener_change_tx: watch::Sender<u64>,
 	listener_change_rx: watch::Receiver<u64>,
+	mcp_tool_policies: watch::Sender<McpToolPolicies>,
 
 	tx: tokio::sync::mpsc::UnboundedSender<BindEvent>,
 	rx: Option<tokio::sync::mpsc::UnboundedReceiver<BindEvent>>,
+}
+
+// Standalone route rules are attached to each route backend during conversion.
+type McpRouteToolPolicies = Arc<[(BackendKey, Vec<serde_json::Value>)]>;
+type McpToolPolicies = HashMap<RouteKey, McpRouteToolPolicies>;
+
+pub(crate) struct McpToolListChanges {
+	route: RouteKey,
+	policies: watch::Receiver<McpToolPolicies>,
+	last: Option<McpRouteToolPolicies>,
+}
+
+impl McpToolListChanges {
+	pub(crate) async fn changed(&mut self) -> bool {
+		while self.policies.changed().await.is_ok() {
+			let current = self.policies.borrow_and_update().get(&self.route).cloned();
+			if current != self.last {
+				self.last = current;
+				return true;
+			}
+		}
+		false
+	}
 }
 
 #[derive(Debug)]
@@ -697,6 +721,7 @@ impl Store {
 			tcp_routes: Default::default(),
 			listener_change_tx,
 			listener_change_rx,
+			mcp_tool_policies: watch::Sender::new(HashMap::new()),
 			tx,
 			rx: Some(rx),
 		}
@@ -740,6 +765,50 @@ impl Store {
 			.listeners
 			.get(bind)
 			.and_then(|listeners| listeners.inner.get(listener).cloned())
+	}
+
+	pub(crate) fn subscribe_mcp_tool_list_changes(&self, route: RouteKey) -> McpToolListChanges {
+		let policies = self.mcp_tool_policies.subscribe();
+		let last = policies.borrow().get(&route).cloned();
+		McpToolListChanges {
+			route,
+			policies,
+			last,
+		}
+	}
+
+	fn record_mcp_tool_policies(&self, route: &Route, policies: &mut McpToolPolicies) {
+		let rules: Vec<_> = route
+			.backends
+			.iter()
+			.filter_map(|backend| {
+				let agent::RouteBackendTarget::Backend(key) = &backend.target else {
+					return None;
+				};
+				if !self
+					.backends
+					.get(key)
+					.is_some_and(|b| matches!(b.backend, Backend::MCP(..)))
+				{
+					return None;
+				}
+				let rules: Vec<_> = backend
+					.inline_policies
+					.iter()
+					.filter_map(|policy| match policy {
+						BackendTrafficPolicy::McpAuthorization(policy) => Some(
+							serde_json::to_value(policy)
+								.expect("MCP authorization rules serialize as CEL expressions"),
+						),
+						_ => None,
+					})
+					.collect();
+				(!rules.is_empty()).then(|| (key.clone(), rules))
+			})
+			.collect();
+		if !rules.is_empty() {
+			policies.insert(route.key.clone(), rules.into());
+		}
 	}
 
 	fn notify_listener_changed(&self) {
@@ -2299,8 +2368,10 @@ impl StoreUpdater {
 			next_state.backends.insert(b.backend.name());
 			s.insert_backend(b.backend.name(), b);
 		}
+		let mut mcp_tool_policies = McpToolPolicies::new();
 		for (listener_key, routes) in listener_routes {
 			for route in routes {
+				s.record_mcp_tool_policies(&route, &mut mcp_tool_policies);
 				old_routes.remove(&route.key);
 				next_state.routes.insert(route.key.clone());
 				s.insert_route(route, listener_key.clone());
@@ -2322,6 +2393,7 @@ impl StoreUpdater {
 			old_route_groups.remove(&rg_key);
 			next_state.route_groups.insert(rg_key.clone());
 			for r in routes {
+				s.record_mcp_tool_policies(&r, &mut mcp_tool_policies);
 				s.insert_route_into_group(r, rg_key.clone());
 			}
 		}
@@ -2350,6 +2422,13 @@ impl StoreUpdater {
 				bind_errors.join("; ")
 			);
 		}
+		s.mcp_tool_policies.send_if_modified(|current| {
+			if *current == mcp_tool_policies {
+				return false;
+			}
+			*current = mcp_tool_policies;
+			true
+		});
 		Ok(next_state)
 	}
 }

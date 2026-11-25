@@ -737,6 +737,22 @@ impl Relay {
 		}
 		Ok(())
 	}
+
+	fn tool_list_changes(
+		&self,
+		ctx: &IncomingRequestContext,
+	) -> Option<crate::store::McpToolListChanges> {
+		let route = ctx.extensions().get::<mcp::ToolListRoute>()?;
+		Some(
+			self
+				.policy_client
+				.inputs
+				.stores
+				.read_binds()
+				.subscribe_mcp_tool_list_changes(route.0.clone()),
+		)
+	}
+
 	pub fn is_multiplexing(&self) -> bool {
 		self.upstreams.is_multiplexing
 	}
@@ -1422,6 +1438,11 @@ impl Relay {
 			synthesize_listen_ack,
 		};
 		let id = r.id.clone();
+		let tool_list_changes = if client_filter.tools_list_changed == Some(true) {
+			self.tool_list_changes(&ctx)
+		} else {
+			None
+		};
 		let has_global_filter = client_filter.tools_list_changed == Some(true)
 			|| client_filter.prompts_list_changed == Some(true)
 			|| client_filter.resources_list_changed == Some(true);
@@ -1471,6 +1492,8 @@ impl Relay {
 
 		let ack_filter =
 			client_filter_from_accepted(&client_filter, &resource_subs, &accepted_filter, &prepared);
+		let tool_list_changes =
+			tool_list_changes.filter(|_| ack_filter.tools_list_changed == Some(true));
 		let ack = synthesize_listen_ack(id.clone(), ack_filter);
 		let pipelines = prepared
 			.into_iter()
@@ -1498,7 +1521,11 @@ impl Relay {
 
 		let merged =
 			mergestream::MergeStream::new_without_merge(pipelines, self.upstreams.failure_mode);
-		let body = futures::stream::once(async move { Ok(ack) }).chain(merged);
+		let body = futures::stream::once(async move { Ok(ack) }).chain(with_tool_list_changes(
+			merged,
+			tool_list_changes,
+			Some(id.clone()),
+		));
 
 		respond_with_guardrails(
 			id,
@@ -1626,6 +1653,12 @@ impl Relay {
 	) -> Result<Response, UpstreamError> {
 		let mut streams = Vec::new();
 		let mut unsupported_get_streams = 0;
+		// The separate legacy SSE transport opens its upstream GET during an initialize POST.
+		let tool_list_changes = if ctx.request.method() == http::Method::GET {
+			self.tool_list_changes(&ctx)
+		} else {
+			None
+		};
 
 		let futs: Vec<_> = self
 			.upstreams
@@ -1688,7 +1721,7 @@ impl Relay {
 			// reconnect in a tight loop after all upstream GET streams disappear.
 			return messages_to_response(
 				RequestId::Number(0),
-				Messages::pending(),
+				with_tool_list_changes(Messages::pending(), tool_list_changes, None),
 				None,
 				ctx_downstream_modern(&ctx),
 				self.upstreams.sse_keep_alive,
@@ -1698,7 +1731,7 @@ impl Relay {
 		let ms = mergestream::MergeStream::new_without_merge(streams, self.upstreams.failure_mode);
 		messages_to_response(
 			RequestId::Number(0),
-			ms,
+			with_tool_list_changes(ms, tool_list_changes, None),
 			None,
 			ctx_downstream_modern(&ctx),
 			self.upstreams.sse_keep_alive,
@@ -2114,6 +2147,35 @@ impl UpstreamNotifications {
 		self.resources_list_changed |= resources.and_then(|c| c.list_changed) == Some(true);
 		self.resources_subscribe |= resources.and_then(|c| c.subscribe) == Some(true);
 	}
+}
+
+fn with_tool_list_changes(
+	upstream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Unpin + Send + 'static,
+	changes: Option<crate::store::McpToolListChanges>,
+	subscription_id: Option<RequestId>,
+) -> impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static {
+	use futures::future::Either;
+
+	let Some(changes) = changes else {
+		return Either::Left(upstream);
+	};
+	let mut notification = ServerNotification::ToolListChangedNotification(Default::default());
+	if let Some(id) = subscription_id {
+		notification.get_meta_mut().set_subscription_id(id);
+	}
+	let message = ServerJsonRpcMessage::notification(notification);
+	Either::Right(futures::stream::unfold(
+		(upstream, changes, message),
+		|(mut upstream, mut changes, message)| async move {
+			let next = tokio::select! {
+				item = upstream.next() => item,
+				changed = changes.changed() => {
+					if changed { Some(Ok(message.clone())) } else { upstream.next().await }
+				},
+			};
+			next.map(|item| (item, (upstream, changes, message)))
+		},
+	))
 }
 
 fn listen_filter_for_target(

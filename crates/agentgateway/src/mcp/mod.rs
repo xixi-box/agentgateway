@@ -40,6 +40,9 @@ use crate::http::SyncResponse;
 use crate::proxy::ProxyError;
 use crate::{apply, schema};
 
+#[derive(Clone)]
+pub(crate) struct ToolListRoute(pub crate::types::agent::RouteKey);
+
 #[apply(schema!)]
 #[derive(Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schema", schemars(rename = "McpBackendFailureMode"))]

@@ -1127,6 +1127,11 @@ impl HTTPProxy {
 			.snapshot_on_err(log, &mut req)?
 			.ok_or(ProxyError::NoValidBackends)
 			.snapshot_on_err(log, &mut req)?;
+		if matches!(&selected_backend.backend.backend, Backend::MCP(..)) {
+			req
+				.extensions_mut()
+				.insert(mcp::ToolListRoute(selected_route.key.clone()));
+		}
 		let backend_policies = Arc::new(get_backend_policies(
 			self.inputs.as_ref(),
 			&selected_backend.backend,

@@ -16,6 +16,7 @@ use std::ops::Deref;
 use std::sync::{RwLock, RwLockReadGuard};
 use std::thread::LocalKey;
 
+pub(crate) use binds::McpToolListChanges;
 pub use binds::{Dump as BindsDump, PreviousState as BindPreviousState};
 pub use discovery::{
 	Dump as DiscoveryDump, LocalWorkload, PreviousState as DiscoveryPreviousState,
